@@ -1,20 +1,46 @@
 import base64
-import numpy as np
+import binascii
+from typing import Optional
+
 import cv2
-from fastapi import FastAPI, WebSocket,WebSocketDisconnect
+import numpy as np
+from deepface import DeepFace
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
 app = FastAPI()
+
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-def decode_frame(data:str):
+def decode_frame(data: str) -> Optional[np.ndarray]:
     try:
         img_bytes = base64.b64decode(data)
-    except Exception:
+    except binascii.Error:
         return None
-    nparr = np.frombuffer(img_bytes,np.uint8)
-    return cv2.imdecode(nparr,cv2.IMREAD_COLOR)
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+def predict_gender(face_bgr: np.ndarray) -> str:
+    try:
+        face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+        result = DeepFace.analyze(
+            face_rgb,
+            actions=["gender"],
+            enforce_detection=False,
+        )
+        if isinstance(result, list):
+            result = result[0]
+        gender = result.get("dominant_gender", "unknown")
+        score = result.get("gender", {}).get(gender, 0)
+        return f"{gender} {score:.0f}%"
+    except Exception as exc:
+        print(f"DeepFace error: {exc}")
+        return "unknown"
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
@@ -25,12 +51,30 @@ async def ws_endpoint(ws: WebSocket):
             frame = decode_frame(payload)
             if frame is None:
                 continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+
+            for (x, y, w, h) in faces:
+                face_crop = frame[y : y + h, x : x + w]
+                label = predict_gender(face_crop)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(
+                    frame,
+                    label,
+                    (x, max(0, y - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+
             ok, buffer = cv2.imencode(".jpg", frame)
             if not ok:
                 continue
+
             await ws.send_text(base64.b64encode(buffer).decode())
     except WebSocketDisconnect:
         pass
     finally:
         await ws.close()
-    
