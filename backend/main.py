@@ -1,20 +1,23 @@
 import base64
 import binascii
-from typing import Optional
 import logging
+from typing import Optional
+
 import cv2
 import numpy as np
-from starlette.websockets import WebSocketState
 from deepface import DeepFace
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 app = FastAPI()
-
 logging.basicConfig(level=logging.INFO)
+
+# MODELLERİ ELLE BUILD ETMİYORUZ
+# DeepFace.analyze içinden gender modelini kendisi yükleyecek
+INFERENCE_INTERVAL = 10
 
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    
 )
 
 @app.get("/health")
@@ -26,24 +29,40 @@ def decode_frame(data: str) -> Optional[np.ndarray]:
         img_bytes = base64.b64decode(data)
     except binascii.Error:
         return None
+
     nparr = np.frombuffer(img_bytes, np.uint8)
     return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
 def predict_gender(face_bgr: np.ndarray) -> str:
+    """
+    Bir yüz kırpıntısından cinsiyet tahmini yapar.
+    DeepFace.analyze, modeli içten cache'leyip tekrar kullanır.
+    """
     try:
         face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+
         result = DeepFace.analyze(
             face_rgb,
             actions=["gender"],
-            enforce_detection=False,
+            enforce_detection=False,   # yüz tespiti bizde
+            detector_backend="skip",   # zaten crop yolluyoruz
         )
+
+        # Bazı sürümler list, bazıları dict dönebiliyor:
         if isinstance(result, list):
             result = result[0]
-        gender = result.get("dominant_gender", "unknown")
-        score = result.get("gender", {}).get(gender, 0)
-        return f"{gender} {score:.0f}%"
+
+        dominant_gender = result.get("dominant_gender", "unknown")
+        gender_scores = result.get("gender", {})
+
+        score = 0.0
+        if isinstance(gender_scores, dict):
+            score = gender_scores.get(dominant_gender, 0.0)
+
+        return f"{dominant_gender} {score:.0f}%"
+
     except Exception as exc:
-        print(f"DeepFace error: {exc}")
+        logging.exception("DeepFace error: %s", exc)
         return "unknown"
 
 @app.websocket("/ws")
@@ -57,13 +76,19 @@ async def ws_endpoint(ws: WebSocket):
                 continue
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.03, minNeighbors=3, minSize=(60,60))
+            faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.03,
+                minNeighbors=3,
+                minSize=(60, 60),
+            )
             logging.info("karede %d yüz bulundu", len(faces))
 
             for (x, y, w, h) in faces:
                 face_crop = frame[y : y + h, x : x + w]
                 label = predict_gender(face_crop)
                 logging.info("tahmin: %s", label)
+
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.putText(
                     frame,
@@ -80,6 +105,7 @@ async def ws_endpoint(ws: WebSocket):
                 continue
 
             await ws.send_text(base64.b64encode(buffer).decode())
+
     except WebSocketDisconnect:
         pass
     finally:
