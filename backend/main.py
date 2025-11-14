@@ -1,16 +1,20 @@
 import base64
 import binascii
 from typing import Optional
-
+import logging
 import cv2
 import numpy as np
+from starlette.websockets import WebSocketState
 from deepface import DeepFace
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 app = FastAPI()
 
+logging.basicConfig(level=logging.INFO)
+
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    
 )
 
 @app.get("/health")
@@ -53,11 +57,13 @@ async def ws_endpoint(ws: WebSocket):
                 continue
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.03, minNeighbors=3, minSize=(60,60))
+            logging.info("karede %d yüz bulundu", len(faces))
 
             for (x, y, w, h) in faces:
                 face_crop = frame[y : y + h, x : x + w]
                 label = predict_gender(face_crop)
+                logging.info("tahmin: %s", label)
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.putText(
                     frame,
@@ -77,4 +83,5 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        await ws.close()
+        if ws.application_state != WebSocketState.DISCONNECTED:
+            await ws.close()
